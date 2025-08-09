@@ -8,6 +8,44 @@ use bevy::render::texture::ImagePlugin;
 use bevy::window::CursorMoved;
 use rayon::prelude::*;
 
+use bevy::render::mesh::PrimitiveTopology;
+
+use bevy::reflect::TypePath;
+use bevy::render::render_resource::{AsBindGroup, ShaderRef};
+
+#[derive(Resource)]
+struct GridSettings {
+    is_visible: bool,
+    size: u32,
+    spacing: f32,
+}
+
+impl Default for GridSettings {
+    fn default() -> Self {
+        Self {
+            is_visible: true,
+            size: 25,
+            spacing: 1e10,
+        }
+    }
+}
+
+#[derive(Component)]
+struct Grid;
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct GridMaterial {
+    #[uniform(0)]
+    color: LinearRgba,
+}
+
+impl Material for GridMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/grid_material.wgsl".into()
+    }
+}
+
+
 // Physical constants
 const SPEED_OF_LIGHT: f64 = 299_792_458.0; // m/s (unused but kept for clarity)
 const GRAVITATIONAL_CONSTANT: f64 = 6.67430e-11; // m^3 kg^-1 s^-2
@@ -19,16 +57,15 @@ const INITIAL_IMAGE_HEIGHT: usize = 180;
 #[derive(Resource, Clone, Copy)]
 struct BlackHole {
     position: DVec3,
-    mass_kg: f64,
+    
     schwarzschild_radius_m: f64,
 }
 
 impl BlackHole {
-    fn new(position: DVec3, mass_kg: f64) -> Self {
-        let r_s = 2.0 * GRAVITATIONAL_CONSTANT * mass_kg / (SPEED_OF_LIGHT * SPEED_OF_LIGHT);
+    fn new(position: DVec3) -> Self {
+        let r_s = 2.0 * GRAVITATIONAL_CONSTANT * 8.54e36 / (SPEED_OF_LIGHT * SPEED_OF_LIGHT);
         Self {
             position,
-            mass_kg,
             schwarzschild_radius_m: r_s,
         }
     }
@@ -90,13 +127,14 @@ fn main() {
             INITIAL_IMAGE_WIDTH as u32,
             INITIAL_IMAGE_HEIGHT as u32,
         )))
-        .insert_resource(BlackHole::new(DVec3::ZERO, 8.54e36))
-        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
-        .add_systems(Startup, setup_texture)
+        .insert_resource(BlackHole::new(DVec3::ZERO))
+        .add_plugins((DefaultPlugins.set(ImagePlugin::default_nearest()), MaterialPlugin::<GridMaterial>::default()))
+        .insert_resource(GridSettings::default())
+        .add_systems(Startup, (setup_texture, setup_grid).chain())
         .add_systems(PostStartup, setup_scene)
         .add_systems(
             Update,
-            (orbit_controls, toggle_geodesics, raytrace_to_texture),
+            (orbit_controls, toggle_geodesics, raytrace_to_texture, update_grid, toggle_grid),
         )
         .run();
 }
@@ -221,6 +259,96 @@ fn toggle_geodesics(mut use_geo: ResMut<UseGeodesics>, keys: Res<ButtonInput<Key
     }
 }
 
+fn setup_grid(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<GridMaterial>>,
+    settings: Res<GridSettings>,
+) {
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::RENDER_WORLD);
+    update_mesh_geometry(&mut mesh, &settings, &BlackHole::new(DVec3::ZERO));
+
+    commands.spawn((
+        MaterialMeshBundle {
+            mesh: meshes.add(mesh),
+            material: materials.add(GridMaterial { color: Color::WHITE.into() }),
+            ..default()
+        },
+        Grid,
+    ));
+}
+
+fn update_grid(
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut query: Query<(&Handle<Mesh>, &mut Visibility), With<Grid>>,
+    settings: Res<GridSettings>,
+    bh: Res<BlackHole>,
+) {
+    if !settings.is_changed() && !bh.is_changed() {
+        return;
+    }
+    for (mesh_handle, mut visibility) in query.iter_mut() {
+        if settings.is_visible {
+            *visibility = Visibility::Visible;
+        } else {
+            *visibility = Visibility::Hidden;
+        }
+
+        if let Some(mesh) = meshes.get_mut(mesh_handle) {
+            update_mesh_geometry(mesh, &settings, &bh);
+        }
+    }
+}
+
+fn update_mesh_geometry(mesh: &mut Mesh, settings: &GridSettings, bh: &BlackHole) {
+    let size = settings.size as usize;
+    let spacing = settings.spacing;
+    let num_vertices = (size + 1) * (size + 1);
+    let mut positions = Vec::with_capacity(num_vertices);
+    let mut indices = Vec::with_capacity(size * size * 4);
+
+    for z in 0..=size {
+        for x in 0..=size {
+            let world_x = (x as f32 - size as f32 / 2.0) * spacing;
+            let world_z = (z as f32 - size as f32 / 2.0) * spacing;
+            let mut y = 0.0;
+
+            let dx = world_x as f64 - bh.position.x;
+            let dz = world_z as f64 - bh.position.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+
+            if dist > bh.schwarzschild_radius_m {
+                let delta_y = 2.0 * (bh.schwarzschild_radius_m * (dist - bh.schwarzschild_radius_m)).sqrt();
+                y += delta_y as f32 - 3e10;
+            } else {
+                y += 2.0 * bh.schwarzschild_radius_m as f32 - 3e10;
+            }
+
+            positions.push([world_x, y, world_z]);
+        }
+    }
+
+    for z in 0..size {
+        for x in 0..size {
+            let i = z * (size + 1) + x;
+            indices.push(i as u32);
+            indices.push((i + 1) as u32);
+            indices.push(i as u32);
+            indices.push((i + size + 1) as u32);
+        }
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
+}
+
+fn toggle_grid(mut settings: ResMut<GridSettings>, keys: Res<ButtonInput<KeyCode>>) {
+    if keys.just_pressed(KeyCode::KeyH) {
+        settings.is_visible = !settings.is_visible;
+    }
+}
+
+
 fn raytrace_to_texture(
     textures: Res<RayTexture>,
     mut images: ResMut<Assets<Image>>,
@@ -273,12 +401,12 @@ fn raytrace_to_texture(
             let escape_r = 1e14_f64;
             let mut col = Vec3::ZERO;
             for _ in 0..max_steps {
-                if bh.intercept(DVec3::new(ray.x, ray.y, ray.z)) {
+                if bh.intercept(ray.pos) {
                     col = Vec3::new(1.0, 0.0, 0.0);
                     break;
                 }
                 ray.rk4_step(d_lambda, bh.schwarzschild_radius_m);
-                if ray.r > escape_r {
+                if ray.pos.length() > escape_r {
                     break;
                 }
             }
@@ -298,91 +426,100 @@ fn raytrace_to_texture(
 // ---------------- Geodesic integration (Schwarzschild, null) -----------------
 
 struct GeodesicRay {
-    x: f64,
-    y: f64,
-    z: f64,
-    r: f64,
-    theta: f64,
-    phi: f64,
-    dr: f64,
-    dtheta: f64,
-    dphi: f64,
-    e: f64,
-    l: f64,
+    pos: DVec3,
+    vel: DVec3,
+    e: f64, // Conserved energy
+    
 }
 
 impl GeodesicRay {
     fn from_pos_dir(pos: DVec3, dir: DVec3, rs: f64) -> Self {
-        let x = pos.x;
-        let y = pos.y;
-        let z = pos.z;
-        let r = (x * x + y * y + z * z).sqrt();
-        let theta = (z / r).acos();
-        let phi = y.atan2(x);
+        let r = pos.length();
+        let theta = (pos.z / r).acos();
+        let phi = pos.y.atan2(pos.x);
 
         // Convert direction into spherical basis
-        let dx = dir.x;
-        let dy = dir.y;
-        let dz = dir.z;
-        let dr = theta.sin() * phi.cos() * dx + theta.sin() * phi.sin() * dy + theta.cos() * dz;
-        let mut dtheta =
-            (theta.cos() * phi.cos() * dx + theta.cos() * phi.sin() * dy - theta.sin() * dz) / r;
-        let mut dphi = (-phi.sin() * dx + phi.cos() * dy) / (r * theta.sin());
+        let dr = theta.sin() * phi.cos() * dir.x
+            + theta.sin() * phi.sin() * dir.y
+            + theta.cos() * dir.z;
+        let dtheta = (theta.cos() * phi.cos() * dir.x
+            + theta.cos() * phi.sin() * dir.y
+            - theta.sin() * dir.z)
+            / r;
+        let dphi = (-phi.sin() * dir.x + phi.cos() * dir.y) / (r * theta.sin());
 
-        // Conserved quantities
-        let l = r * r * theta.sin() * dphi;
         let f = 1.0 - rs / r;
-        let dt_dlambda = ((dr * dr) / f
-            + r * r * (dtheta * dtheta + theta.sin() * theta.sin() * dphi * dphi))
-            .sqrt();
+        let dt_dlambda =
+            ((dr * dr) / f + r * r * (dtheta * dtheta + theta.sin().powi(2) * dphi * dphi)).sqrt();
         let e = f * dt_dlambda;
 
         Self {
-            x,
-            y,
-            z,
-            r,
-            theta,
-            phi,
-            dr,
-            dtheta,
-            dphi,
+            pos,
+            vel: DVec3::new(dr, dtheta, dphi),
             e,
-            l,
         }
     }
 
-    fn geodesic_rhs(&self, rs: f64) -> ([f64; 3], [f64; 3]) {
-        let r = self.r;
-        let theta = self.theta;
-        let dr = self.dr;
-        let dtheta = self.dtheta;
-        let dphi = self.dphi;
-        let e = self.e;
+    // Returns (d/dλ)[r, θ, φ] and (d/dλ)[dr, dθ, dφ]
+    fn geodesic_rhs(&self, rs: f64) -> (DVec3, DVec3) {
+        let r = self.pos.length();
+        let theta = (self.pos.z / r).acos();
+        let (dr, dtheta, dphi) = (self.vel.x, self.vel.y, self.vel.z);
+
         let f = 1.0 - rs / r;
-        let dt_dlambda = e / f;
-        let d1 = [dr, dtheta, dphi];
-        let d2x = -(rs / (2.0 * r * r)) * f * dt_dlambda * dt_dlambda
-            + (rs / (2.0 * r * r * f)) * dr * dr
-            + r * (dtheta * dtheta + theta.sin() * theta.sin() * dphi * dphi);
-        let d2y = -(2.0 / r) * dr * dtheta + theta.sin() * theta.cos() * dphi * dphi;
-        let d2z = -(2.0 / r) * dr * dphi - 2.0 * theta.cos() / theta.sin() * dtheta * dphi;
-        (d1, [d2x, d2y, d2z])
+        let dt_dlambda = self.e / f;
+
+        let d_vel = DVec3::new(
+            // d²r/dλ²
+            -(rs / (2.0 * r * r)) * f * dt_dlambda.powi(2)
+                + (rs / (2.0 * r * r * f)) * dr * dr
+                + r * (dtheta.powi(2) + theta.sin().powi(2) * dphi.powi(2)),
+            // d²θ/dλ²
+            -(2.0 / r) * dr * dtheta + theta.sin() * theta.cos() * dphi.powi(2),
+            // d²φ/dλ²
+            -(2.0 / r) * dr * dphi - 2.0 * theta.cos() / theta.sin() * dtheta * dphi,
+        );
+
+        (self.vel, d_vel)
     }
 
     fn rk4_step(&mut self, d_lambda: f64, rs: f64) {
-        let (k1a, k1b) = self.geodesic_rhs(rs);
+        let (k1_pos, k1_vel) = self.geodesic_rhs(rs);
 
-        self.r += d_lambda * k1a[0];
-        self.theta += d_lambda * k1a[1];
-        self.phi += d_lambda * k1a[2];
-        self.dr += d_lambda * k1b[0];
-        self.dtheta += d_lambda * k1b[1];
-        self.dphi += d_lambda * k1b[2];
+        let mut temp_ray = *self;
+        temp_ray.pos += k1_pos * (d_lambda / 2.0);
+        temp_ray.vel += k1_vel * (d_lambda / 2.0);
+        let (k2_pos, k2_vel) = temp_ray.geodesic_rhs(rs);
 
-        // Back to Cartesian
-        self.x = self.r * self.theta.sin() * self.phi.cos();
-        self.y = self.r * self.theta.sin() * self.phi.sin();
-        self.z = self.r * self.theta.cos();
+        let mut temp_ray = *self;
+        temp_ray.pos += k2_pos * (d_lambda / 2.0);
+        temp_ray.vel += k2_vel * (d_lambda / 2.0);
+        let (k3_pos, k3_vel) = temp_ray.geodesic_rhs(rs);
+
+        let mut temp_ray = *self;
+        temp_ray.pos += k3_pos * d_lambda;
+        temp_ray.vel += k3_vel * d_lambda;
+        let (k4_pos, k4_vel) = temp_ray.geodesic_rhs(rs);
+
+        self.pos += (d_lambda / 6.0) * (k1_pos + 2.0 * k2_pos + 2.0 * k3_pos + k4_pos);
+        self.vel += (d_lambda / 6.0) * (k1_vel + 2.0 * k2_vel + 2.0 * k3_vel + k4_vel);
+
+        let r = self.pos.length();
+        let theta = (self.pos.z / r).acos();
+        let phi = self.pos.y.atan2(self.pos.x);
+
+        self.pos = DVec3::new(
+            r * theta.sin() * phi.cos(),
+            r * theta.sin() * phi.sin(),
+            r * theta.cos(),
+        );
+    }
+}
+
+impl Copy for GeodesicRay {}
+
+impl Clone for GeodesicRay {
+    fn clone(&self) -> Self {
+        *self
     }
 }
