@@ -12,6 +12,7 @@ use bevy::render::mesh::PrimitiveTopology;
 
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{AsBindGroup, ShaderRef};
+use bevy::render::camera::PerspectiveProjection;
 
 #[derive(Resource)]
 struct GridSettings {
@@ -153,7 +154,8 @@ fn setup_texture(
         TextureDimension::D2,
         &[0, 0, 0, 255],
         TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
+        // Keep the image accessible in both main and render worlds so CPU writes show up on GPU
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
     image.texture_descriptor.usage = TextureUsages::COPY_DST
         | TextureUsages::TEXTURE_BINDING
@@ -171,40 +173,50 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     orbit: Res<CameraOrbit>,
 ) {
-    // Show the ray-traced image on a quad in front of the camera
-    // Create a plane and apply the texture via Pbr material
+    // Prepare a screen-space quad sized by the ray texture aspect
     let width = size.0.x as f32;
     let height = size.0.y as f32;
     let aspect = width / height;
-
     let plane_size = Vec2::new(2.0 * aspect, 2.0);
 
-    // Create a simple unlit material that uses the texture
+    // Unlit textured material; render both faces so orientation doesn't matter
     let mut mat = StandardMaterial::from_color(Color::WHITE);
     mat.base_color_texture = Some(textures.0.clone());
     mat.unlit = true;
+    mat.cull_mode = None;
     let mat_handle = materials.add(mat);
 
+    // Fullscreen rectangle mesh with UVs
     let mut mesh = Mesh::from(Rectangle::new(plane_size.x, plane_size.y));
-    // Ensure UVs exist
     if mesh.attribute(Mesh::ATTRIBUTE_UV_0).is_none() {
         let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     }
     let mesh_handle = meshes.add(mesh);
 
-    commands.spawn(PbrBundle {
-        mesh: mesh_handle,
-        material: mat_handle,
-        transform: Transform::from_xyz(0.0, 0.0, -1.0),
-        ..default()
-    });
-
-    // Place camera at orbit position looking at target
+    // Camera setup with a very large far plane to accommodate simulation scale
     let cam_pos = orbit.position().as_vec3();
-    commands.spawn(Camera3dBundle {
-        transform: Transform::from_translation(cam_pos).looking_at(orbit.target.as_vec3(), Vec3::Y),
+    let mut cam_bundle = Camera3dBundle {
+        transform: Transform::from_translation(cam_pos)
+            .looking_at(orbit.target.as_vec3(), Vec3::Y),
         ..default()
+    };
+    let mut persp = PerspectiveProjection::default();
+    persp.far = 1.0e16;
+    persp.near = 0.1;
+    cam_bundle.projection = persp.into();
+
+    let cam_entity = commands.spawn(cam_bundle).id();
+
+    // Make the quad a child of the camera so it always sits in front of it
+    commands.entity(cam_entity).with_children(|parent| {
+        parent.spawn(PbrBundle {
+            mesh: mesh_handle,
+            material: mat_handle,
+            // Negative Z is forward in camera space
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, -1.0)),
+            ..default()
+        });
     });
 }
 
